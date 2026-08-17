@@ -191,7 +191,116 @@ describe('remote store', () => {
 		expect((await store.readManifest())?.manifest).toEqual(second.manifest);
 	});
 
-	it('leaves the active revision intact when a top-level COPY is unsupported', async () => {
+	it.each([405, 501, 500, 502])(
+		'falls back to a complete upload when top-level COPY returns HTTP %i',
+		async (status: number) => {
+			const { gateway, root, server, store } = await createStore();
+			const first = await store.publishRevision({
+				allowUnverifiedManifest: false,
+				expectedManifestSha256: undefined,
+				files: [
+					{ contents: Buffer.from('first'), path: parseManifestPath('settings.json') },
+					{ contents: Buffer.from('dark'), path: parseManifestPath('themes/dark.txt') },
+				],
+			});
+			const snapshot = await store.readManifest();
+			if (snapshot === undefined) {
+				throw new Error('Expected a manifest after publishing');
+			}
+			server.requests.splice(0);
+			server.failNext('COPY', `${root}/revisions/${first.manifest.revision}/themes`, status);
+
+			const second = await store.publishRevision({
+				allowUnverifiedManifest: false,
+				expectedManifestSha256: snapshot.sha256,
+				files: [
+					{ contents: Buffer.from('second'), path: parseManifestPath('settings.json') },
+					{ contents: Buffer.from('dark'), path: parseManifestPath('themes/dark.txt') },
+				],
+			});
+			const revisionRoot = `${root}/revisions/${second.manifest.revision}`;
+			const revisionFragment = `/revisions/${second.manifest.revision}/`;
+
+			expect(server.requests.filter((request) => request.method === 'COPY')).toHaveLength(1);
+			expect(
+				server.requests.some(
+					(request) => request.method === 'DELETE' && request.pathname === `/dav/${revisionRoot}`,
+				),
+			).toBe(true);
+			expect(
+				server.requests
+					.filter(
+						(request) => request.method === 'PUT' && request.pathname.includes(revisionFragment),
+					)
+					.map((request) => request.pathname)
+					.sort(),
+			).toEqual([`/dav/${revisionRoot}/settings.json`, `/dav/${revisionRoot}/themes/dark.txt`]);
+			await expect(
+				gateway.readFile(parseRemotePath(`${revisionRoot}/settings.json`)),
+			).resolves.toEqual(Buffer.from('second'));
+			await expect(
+				gateway.readFile(parseRemotePath(`${revisionRoot}/themes/dark.txt`)),
+			).resolves.toEqual(Buffer.from('dark'));
+			expect((await store.readManifest())?.manifest).toEqual(second.manifest);
+			expect(await gateway.directoryContents(parseRemotePath(`${root}/revisions`))).toEqual([
+				{ basename: second.manifest.revision, type: 'directory' },
+			]);
+		},
+	);
+
+	it('does not fall back when a concurrent COPY result is uncertain', async () => {
+		const { gateway, root, server, store } = await createStore();
+		const first = await store.publishRevision({
+			allowUnverifiedManifest: false,
+			expectedManifestSha256: undefined,
+			files: [
+				{ contents: Buffer.from('agents'), path: parseManifestPath('AGENTS.md') },
+				{ contents: Buffer.from('first'), path: parseManifestPath('settings.json') },
+				{ contents: Buffer.from('dark'), path: parseManifestPath('themes/dark.txt') },
+			],
+		});
+		const snapshot = await store.readManifest();
+		if (snapshot === undefined) {
+			throw new Error('Expected a manifest after publishing');
+		}
+		server.requests.splice(0);
+		const failingGateway = overrideGateway(gateway, {
+			copyPath: async (source) => {
+				if (source.endsWith('/AGENTS.md')) {
+					await delay(1);
+					throw new WebDavRequestError('WebDAV COPY failed with HTTP status 500', {
+						retryable: true,
+						status: 500,
+					});
+				}
+				await delay(10);
+				throw new WebDavRequestError('WebDAV request timed out', { retryable: true });
+			},
+		});
+
+		await expect(
+			new RemoteStore(failingGateway, root).publishRevision({
+				allowUnverifiedManifest: false,
+				expectedManifestSha256: snapshot.sha256,
+				files: [
+					{ contents: Buffer.from('agents'), path: parseManifestPath('AGENTS.md') },
+					{ contents: Buffer.from('second'), path: parseManifestPath('settings.json') },
+					{ contents: Buffer.from('dark'), path: parseManifestPath('themes/dark.txt') },
+				],
+			}),
+		).rejects.toThrow('WebDAV request timed out');
+		expect((await store.readManifest())?.manifest).toEqual(first.manifest);
+		expect(
+			server.requests.filter(
+				(request) => request.method === 'PUT' && request.pathname.includes('/revisions/'),
+			),
+		).toEqual([]);
+		expect(await gateway.directoryContents(parseRemotePath(`${root}/revisions`))).toEqual([
+			{ basename: first.manifest.revision, type: 'directory' },
+		]);
+	});
+
+	it('does not start the complete upload when the failed COPY revision cannot be removed', async () => {
 		const { gateway, root, server, store } = await createStore();
 		const first = await store.publishRevision({
 			allowUnverifiedManifest: false,
@@ -205,10 +314,29 @@ describe('remote store', () => {
 		if (snapshot === undefined) {
 			throw new Error('Expected a manifest after publishing');
 		}
-		server.failNext('COPY', `${root}/revisions/${first.manifest.revision}/themes`, 405);
+		server.requests.splice(0);
+		const previousRevisionPath = parseRemotePath(`${root}/revisions/${first.manifest.revision}`);
+		const failingGateway = overrideGateway(gateway, {
+			copyPath: async (source, destination, options) => {
+				await gateway.copyPath(source, destination, options);
+				throw new WebDavRequestError('WebDAV COPY failed with HTTP status 500', {
+					retryable: true,
+					status: 500,
+				});
+			},
+			deletePath: async (path, options) => {
+				if (path !== previousRevisionPath) {
+					throw new WebDavRequestError('WebDAV request failed with HTTP status 500', {
+						retryable: true,
+						status: 500,
+					});
+				}
+				await gateway.deletePath(path, options);
+			},
+		});
 
 		await expect(
-			store.publishRevision({
+			new RemoteStore(failingGateway, root).publishRevision({
 				allowUnverifiedManifest: false,
 				expectedManifestSha256: snapshot.sha256,
 				files: [
@@ -216,11 +344,14 @@ describe('remote store', () => {
 					{ contents: Buffer.from('dark'), path: parseManifestPath('themes/dark.txt') },
 				],
 			}),
-		).rejects.toMatchObject({ status: 405 });
+		).rejects.toBeInstanceOf(RemoteCommitUnknownError);
 		expect((await store.readManifest())?.manifest).toEqual(first.manifest);
-		expect(await gateway.directoryContents(parseRemotePath(`${root}/revisions`))).toEqual([
-			{ basename: first.manifest.revision, type: 'directory' },
-		]);
+		expect(
+			server.requests.filter(
+				(request) => request.method === 'PUT' && request.pathname.includes('/revisions/'),
+			),
+		).toEqual([]);
+		expect(await gateway.directoryContents(parseRemotePath(`${root}/revisions`))).toHaveLength(2);
 	});
 
 	it('removes a partially copied inactive revision after COPY failure', async () => {

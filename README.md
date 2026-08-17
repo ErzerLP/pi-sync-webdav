@@ -64,7 +64,7 @@ The top-level `npm/`, `git/`, and `pi-sync-webdav/` directories are never synced
 
 ## How sync works
 
-- **push** publishes your currently selected local files to the dedicated remote folder. After the first push, unchanged files are reused on the server and only changed files are uploaded.
+- **push** publishes your currently selected local files to the dedicated remote folder. After the first push, it tries to reuse unchanged files with WebDAV `COPY` and upload only changes. If the server does not support that operation reliably, push removes the incomplete revision and uploads the complete file set instead.
 - **pull** applies the remote file set, even if your local push selection is different. Only added or updated files are downloaded. Review the planned additions, updates, and removals before confirming.
 - **restore** reapplies those local file backups after confirmation. It does not restore a remote version and does not reinstall Pi packages.
 - Before pull replaces or removes managed local files, it backs them up under `pi-sync-webdav/backups/` in the Pi agent directory. Only the latest changed pull is kept; restore leaves the backup in place.

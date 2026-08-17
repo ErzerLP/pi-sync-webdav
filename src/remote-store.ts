@@ -91,6 +91,8 @@ interface WriteCapabilityResult {
 	readonly cleanupFailed: boolean;
 }
 
+type RevisionUploadMode = 'full' | 'incremental';
+
 export class RemoteManifestChangedError extends Error {
 	constructor() {
 		super('The remote manifest changed; run diff again before pushing');
@@ -179,6 +181,15 @@ function throwIfCancelled(options: RemoteOperationOptions | undefined): void {
 	if (options?.signal?.aborted) {
 		throw new WebDavRequestError('WebDAV request cancelled', { retryable: false });
 	}
+}
+
+function canFallbackFromCopy(error: unknown): boolean {
+	if (!(error instanceof WebDavRequestError) || error.status === undefined) {
+		return false;
+	}
+	return (
+		error.status === 405 || error.status === 501 || (error.status >= 500 && error.status <= 599)
+	);
 }
 
 function remoteChild(parent: RemotePath, child: string): RemotePath {
@@ -467,7 +478,7 @@ export class RemoteStore {
 		const manifestSha256 = sha256(manifestBytes);
 		const revisionPath = this.#revisionPath(revision);
 		const previousFiles = new Map(previousManifest?.files.map((file) => [file.path, file]) ?? []);
-		const filesToUpload = preparedFiles.filter((file) => {
+		const changedFiles = preparedFiles.filter((file) => {
 			const previous = previousFiles.get(file.path);
 			return (
 				previous === undefined || previous.sha256 !== file.sha256 || previous.size !== file.size
@@ -477,11 +488,13 @@ export class RemoteStore {
 		let manifestWriteCompleted = false;
 
 		try {
-			if (previousManifest === undefined) {
-				await this.#ensureRevisionDirectory(revisionPath, manifest, options);
-			} else {
-				await this.#reuseRevisionContents(previousManifest, revisionPath, manifest, options);
-			}
+			const uploadMode = await this.#prepareRevisionContents(
+				previousManifest,
+				revisionPath,
+				manifest,
+				options,
+			);
+			const filesToUpload = uploadMode === 'full' ? preparedFiles : changedFiles;
 			let completedUploads = 0;
 			await mapConcurrent(filesToUpload, FILE_OPERATION_CONCURRENCY, async (file) => {
 				throwIfCancelled(options);
@@ -731,22 +744,64 @@ export class RemoteStore {
 		await this.#gateway.createDirectory(revisionPath, requestOptions(options));
 	}
 
-	async #reuseRevisionContents(
+	async #prepareRevisionContents(
+		previousManifest: ManifestV1 | undefined,
+		revisionPath: RemotePath,
+		manifest: ManifestV1,
+		options?: RemoteOperationOptions,
+	): Promise<RevisionUploadMode> {
+		if (previousManifest === undefined) {
+			await this.#ensureRevisionDirectory(revisionPath, manifest, options);
+			return 'full';
+		}
+		if (await this.#tryReuseRevisionContents(previousManifest, revisionPath, manifest, options)) {
+			return 'incremental';
+		}
+
+		const removed = await this.#deleteRevisionIfUnreferenced(
+			manifest.revision,
+			cleanupOptions(options),
+		);
+		if (!removed) {
+			throw new RemoteCommitUnknownError();
+		}
+		await this.#ensureRevisionDirectory(revisionPath, manifest, options);
+		return 'full';
+	}
+
+	async #tryReuseRevisionContents(
 		previousManifest: ManifestV1,
 		revisionPath: RemotePath,
 		manifest: ManifestV1,
 		options?: RemoteOperationOptions,
-	): Promise<void> {
+	): Promise<boolean> {
 		await this.#ensureRevisionRoot(revisionPath, options);
 		const plan = planRevisionReuse(previousManifest, manifest);
 		const previousRevisionPath = this.#revisionPath(previousManifest.revision);
-		await mapConcurrent(plan.copyPaths, FILE_OPERATION_CONCURRENCY, (path) =>
-			this.#gateway.copyPath(
-				remoteChild(previousRevisionPath, path),
-				remoteChild(revisionPath, path),
-				requestOptions(options),
-			),
-		);
+		const copyFailures: Array<{ readonly error: unknown }> = [];
+		let copyFailed = false;
+		await mapConcurrent(plan.copyPaths, FILE_OPERATION_CONCURRENCY, async (path) => {
+			if (copyFailed) {
+				return;
+			}
+			try {
+				await this.#gateway.copyPath(
+					remoteChild(previousRevisionPath, path),
+					remoteChild(revisionPath, path),
+					requestOptions(options),
+				);
+			} catch (error: unknown) {
+				copyFailed = true;
+				copyFailures.push({ error });
+			}
+		});
+		if (copyFailures.length > 0) {
+			const blockingFailure = copyFailures.find(({ error }) => !canFallbackFromCopy(error));
+			if (blockingFailure !== undefined) {
+				throw blockingFailure.error;
+			}
+			return false;
+		}
 		await mapConcurrent(plan.deletionPaths, FILE_OPERATION_CONCURRENCY, (path) =>
 			this.#gateway.deletePath(remoteChild(revisionPath, path), requestOptions(options)),
 		);
@@ -758,6 +813,7 @@ export class RemoteStore {
 				requestOptions(options),
 			);
 		}
+		return true;
 	}
 
 	async #cleanupPreviousRevision(

@@ -93,6 +93,12 @@ interface WriteCapabilityResult {
 
 type RevisionUploadMode = 'full' | 'incremental';
 
+interface RevisionPreparation {
+	readonly createRevisionDirectory: boolean;
+	readonly manifest: ManifestV1;
+	readonly uploadMode: RevisionUploadMode;
+}
+
 export class RemoteManifestChangedError extends Error {
 	constructor() {
 		super('The remote manifest changed; run diff again before pushing');
@@ -465,7 +471,7 @@ export class RemoteStore {
 			sha256: sha256(file.contents),
 			size: file.contents.byteLength,
 		}));
-		const manifest = validateManifest({
+		let manifest = validateManifest({
 			files: preparedFiles.map((file) => ({
 				path: file.path,
 				sha256: file.sha256,
@@ -474,9 +480,6 @@ export class RemoteStore {
 			revision,
 			version: 1,
 		});
-		const manifestBytes = Buffer.from(serializeManifest(manifest), 'utf8');
-		const manifestSha256 = sha256(manifestBytes);
-		const revisionPath = this.#revisionPath(revision);
 		const previousFiles = new Map(previousManifest?.files.map((file) => [file.path, file]) ?? []);
 		const changedFiles = preparedFiles.filter((file) => {
 			const previous = previousFiles.get(file.path);
@@ -488,13 +491,20 @@ export class RemoteStore {
 		let manifestWriteCompleted = false;
 
 		try {
-			const uploadMode = await this.#prepareRevisionContents(
+			const revisionPreparation = await this.#prepareRevisionContents(
 				previousManifest,
-				revisionPath,
 				manifest,
 				options,
 			);
-			const filesToUpload = uploadMode === 'full' ? preparedFiles : changedFiles;
+			manifest = revisionPreparation.manifest;
+			const revisionPath = this.#revisionPath(manifest.revision);
+			if (revisionPreparation.createRevisionDirectory) {
+				await this.#ensureRevisionDirectory(revisionPath, manifest, options);
+			}
+			const manifestBytes = Buffer.from(serializeManifest(manifest), 'utf8');
+			const manifestSha256 = sha256(manifestBytes);
+			const filesToUpload =
+				revisionPreparation.uploadMode === 'full' ? preparedFiles : changedFiles;
 			let completedUploads = 0;
 			await mapConcurrent(filesToUpload, FILE_OPERATION_CONCURRENCY, async (file) => {
 				throwIfCancelled(options);
@@ -544,6 +554,8 @@ export class RemoteStore {
 			return { manifest, previousRevisionCleanup };
 		} catch (error: unknown) {
 			const cleanup = cleanupOptions(options);
+			const manifestBytes = Buffer.from(serializeManifest(manifest), 'utf8');
+			const manifestSha256 = sha256(manifestBytes);
 			if (manifestWriteStarted) {
 				try {
 					const committedManifest = await this.readRawManifest(cleanup);
@@ -561,7 +573,7 @@ export class RemoteStore {
 					throw new RemoteCommitUnknownError();
 				}
 			}
-			if (await this.#deleteRevisionIfUnreferenced(revision, cleanup).catch(() => false)) {
+			if (await this.#deleteRevisionIfUnreferenced(manifest.revision, cleanup).catch(() => false)) {
 				throw error;
 			}
 			throw new RemoteCommitUnknownError();
@@ -746,16 +758,15 @@ export class RemoteStore {
 
 	async #prepareRevisionContents(
 		previousManifest: ManifestV1 | undefined,
-		revisionPath: RemotePath,
 		manifest: ManifestV1,
 		options?: RemoteOperationOptions,
-	): Promise<RevisionUploadMode> {
+	): Promise<RevisionPreparation> {
 		if (previousManifest === undefined) {
-			await this.#ensureRevisionDirectory(revisionPath, manifest, options);
-			return 'full';
+			return { createRevisionDirectory: true, manifest, uploadMode: 'full' };
 		}
+		const revisionPath = this.#revisionPath(manifest.revision);
 		if (await this.#tryReuseRevisionContents(previousManifest, revisionPath, manifest, options)) {
-			return 'incremental';
+			return { createRevisionDirectory: false, manifest, uploadMode: 'incremental' };
 		}
 
 		const removed = await this.#deleteRevisionIfUnreferenced(
@@ -765,8 +776,11 @@ export class RemoteStore {
 		if (!removed) {
 			throw new RemoteCommitUnknownError();
 		}
-		await this.#ensureRevisionDirectory(revisionPath, manifest, options);
-		return 'full';
+		return {
+			createRevisionDirectory: true,
+			manifest: validateManifest({ ...manifest, revision: generateRevisionId() }),
+			uploadMode: 'full',
+		};
 	}
 
 	async #tryReuseRevisionContents(

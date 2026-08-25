@@ -3,7 +3,12 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { generateRevisionId } from '../src/manifest.js';
-import { parseRemotePath, parseManifestPath, normalizeConnection } from '../src/paths.js';
+import {
+	normalizeConnection,
+	parseManifestPath,
+	parseRemotePath,
+	type RemotePath,
+} from '../src/paths.js';
 import {
 	RemoteCommitRejectedError,
 	RemoteCommitUnknownError,
@@ -220,13 +225,17 @@ describe('remote store', () => {
 			});
 			const revisionRoot = `${root}/revisions/${second.manifest.revision}`;
 			const revisionFragment = `/revisions/${second.manifest.revision}/`;
+			const deletedRevisionRoots = server.requests
+				.filter(
+					(request) =>
+						request.method === 'DELETE' && request.pathname.startsWith(`/dav/${root}/revisions/`),
+				)
+				.map((request) => request.pathname);
 
 			expect(server.requests.filter((request) => request.method === 'COPY')).toHaveLength(1);
-			expect(
-				server.requests.some(
-					(request) => request.method === 'DELETE' && request.pathname === `/dav/${revisionRoot}`,
-				),
-			).toBe(true);
+			expect(deletedRevisionRoots).toHaveLength(2);
+			expect(deletedRevisionRoots).toContain(`/dav/${root}/revisions/${first.manifest.revision}`);
+			expect(deletedRevisionRoots).not.toContain(`/dav/${revisionRoot}`);
 			expect(
 				server.requests
 					.filter(
@@ -247,6 +256,79 @@ describe('remote store', () => {
 			]);
 		},
 	);
+
+	it('uses a fresh revision when COPY cleanup leaves an empty collection', async () => {
+		const { gateway, root, store } = await createStore();
+		await store.publishRevision({
+			allowUnverifiedManifest: false,
+			expectedManifestSha256: undefined,
+			files: [
+				{ contents: Buffer.from('first'), path: parseManifestPath('settings.json') },
+				{ contents: Buffer.from('dark'), path: parseManifestPath('themes/dark.txt') },
+			],
+		});
+		const snapshot = await store.readManifest();
+		if (snapshot === undefined) {
+			throw new Error('Expected a manifest after publishing');
+		}
+		let failedRevisionPath: RemotePath | undefined;
+		let retainedFailedRevision = false;
+		const retainingGateway = overrideGateway(gateway, {
+			copyPath: async (source, destination, options) => {
+				const destinationSegments = destination.split('/');
+				destinationSegments.pop();
+				failedRevisionPath = parseRemotePath(destinationSegments.join('/'));
+				await gateway.copyPath(source, destination, options);
+				throw new WebDavRequestError('WebDAV COPY failed with HTTP status 500', {
+					retryable: true,
+					status: 500,
+				});
+			},
+			createDirectory: async (path, options) => {
+				if (retainedFailedRevision && path === failedRevisionPath) {
+					throw new WebDavRequestError('WebDAV request failed with HTTP status 409', {
+						retryable: false,
+						status: 409,
+					});
+				}
+				await gateway.createDirectory(path, options);
+			},
+			deletePath: async (path, options) => {
+				await gateway.deletePath(path, options);
+				if (!retainedFailedRevision && path === failedRevisionPath) {
+					await gateway.createDirectory(path, options);
+					retainedFailedRevision = true;
+				}
+			},
+		});
+
+		const second = await new RemoteStore(retainingGateway, root).publishRevision({
+			allowUnverifiedManifest: false,
+			expectedManifestSha256: snapshot.sha256,
+			files: [
+				{ contents: Buffer.from('second'), path: parseManifestPath('settings.json') },
+				{ contents: Buffer.from('dark'), path: parseManifestPath('themes/dark.txt') },
+			],
+		});
+		if (failedRevisionPath === undefined) {
+			throw new Error('Expected a failed COPY revision');
+		}
+
+		expect(second.manifest.revision).not.toBe(failedRevisionPath.split('/').at(-1));
+		expect(await gateway.directoryContents(failedRevisionPath)).toEqual([]);
+		await expect(
+			gateway.readFile(
+				parseRemotePath(`${root}/revisions/${second.manifest.revision}/settings.json`),
+			),
+		).resolves.toEqual(Buffer.from('second'));
+		expect((await store.readManifest())?.manifest).toEqual(second.manifest);
+		expect(await gateway.directoryContents(parseRemotePath(`${root}/revisions`))).toEqual(
+			expect.arrayContaining([
+				{ basename: failedRevisionPath.split('/').at(-1), type: 'directory' },
+				{ basename: second.manifest.revision, type: 'directory' },
+			]),
+		);
+	});
 
 	it('does not fall back when a concurrent COPY result is uncertain', async () => {
 		const { gateway, root, server, store } = await createStore();
